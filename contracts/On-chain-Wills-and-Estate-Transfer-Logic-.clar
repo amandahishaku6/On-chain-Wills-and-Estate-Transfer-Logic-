@@ -18,6 +18,9 @@
 (define-constant ERR-INSUFFICIENT-VOTES (err u108))
 (define-constant ERR-RECOVERY-PERIOD-ACTIVE (err u109))
 (define-constant ERR-NOT-BACKUP-EXECUTOR (err u110))
+(define-constant ERR-INVALID-ENCRYPTION-KEY (err u111))
+(define-constant ERR-WILL-NOT-ENCRYPTED (err u112))
+(define-constant ERR-ENCRYPTION-ALREADY-SET (err u113))
 
 ;; Data variables
 (define-data-var oracle-address principal 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM)
@@ -104,6 +107,17 @@
     {
         amount: uint,
         beneficiary-shares: (list 10 { address: principal, share: uint })
+    }
+)
+
+;; Encrypted wills map
+(define-map encrypted-wills
+    principal
+    {
+        encrypted-data: (buff 1024),
+        encryption-key-hash: (buff 32),
+        is-encrypted: bool,
+        decryption-authorized: bool
     }
 )
 
@@ -234,6 +248,36 @@
         })
         (ok dispute-id)))
 
+(define-public (encrypt-will-data (encrypted-data (buff 1024)) (encryption-key-hash (buff 32)))
+    (let ((existing-will (unwrap! (get-will tx-sender) ERR-NOT-REGISTERED))
+          (existing-encryption (map-get? encrypted-wills tx-sender)))
+        (asserts! (is-none existing-encryption) ERR-ENCRYPTION-ALREADY-SET)
+        (asserts! (> (len encrypted-data) u0) ERR-INVALID-ENCRYPTION-KEY)
+        (asserts! (> (len encryption-key-hash) u0) ERR-INVALID-ENCRYPTION-KEY)
+        (map-set encrypted-wills tx-sender {
+            encrypted-data: encrypted-data,
+            encryption-key-hash: encryption-key-hash,
+            is-encrypted: true,
+            decryption-authorized: false
+        })
+        (ok true)))
+
+(define-public (authorize-decryption (will-owner principal))
+    (let ((will (unwrap! (get-will will-owner) ERR-NOT-REGISTERED))
+          (encrypted-will (unwrap! (map-get? encrypted-wills will-owner) ERR-WILL-NOT-ENCRYPTED)))
+        (asserts! (or (is-eq tx-sender will-owner)
+                     (is-eq tx-sender (var-get oracle-address))
+                     (> (- burn-block-height (get last-activity will)) (get inactivity-threshold will)))
+                 ERR-NOT-AUTHORIZED)
+        (map-set encrypted-wills will-owner (merge encrypted-will { decryption-authorized: true }))
+        (ok true)))
+
+(define-public (verify-encryption-key (will-owner principal) (encryption-key (buff 32)))
+    (let ((encrypted-will (unwrap! (map-get? encrypted-wills will-owner) ERR-WILL-NOT-ENCRYPTED)))
+        (asserts! (get decryption-authorized encrypted-will) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (sha256 encryption-key) (get encryption-key-hash encrypted-will)) ERR-INVALID-ENCRYPTION-KEY)
+        (ok (get encrypted-data encrypted-will))))
+
 (define-read-only (get-will (owner principal))
     (map-get? wills owner))
 
@@ -251,6 +295,9 @@
 
 (define-read-only (get-backup-executor (executor principal))
     (map-get? backup-executors executor))
+
+(define-read-only (get-encrypted-will (owner principal))
+    (map-get? encrypted-wills owner))
 
 (define-private (execute-will (owner principal))
     (let ((will (unwrap! (get-will owner) ERR-NOT-REGISTERED)))
