@@ -21,6 +21,10 @@
 (define-constant ERR-INVALID-ENCRYPTION-KEY (err u111))
 (define-constant ERR-WILL-NOT-ENCRYPTED (err u112))
 (define-constant ERR-ENCRYPTION-ALREADY-SET (err u113))
+(define-constant ERR-AMENDMENT-NOT-FOUND (err u114))
+(define-constant ERR-AMENDMENT-ALREADY-ACTIVE (err u115))
+(define-constant ERR-GRACE-PERIOD-ACTIVE (err u116))
+(define-constant ERR-AMENDMENT-EXPIRED (err u117))
 
 ;; Data variables
 (define-data-var oracle-address principal 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM)
@@ -28,6 +32,8 @@
 (define-data-var emergency-recovery-period uint u1008)
 (define-data-var dispute-counter uint u0)
 (define-data-var emergency-request-counter uint u0)
+(define-data-var amendment-counter uint u0)
+(define-data-var amendment-grace-period uint u144)
 
 ;; Main wills map
 (define-map wills
@@ -118,8 +124,26 @@
         encryption-key-hash: (buff 32),
         is-encrypted: bool,
         decryption-authorized: bool
-    }
-)
+    })
+
+(define-map will-amendments
+    uint
+    {
+        will-owner: principal,
+        amendment-type: (string-ascii 20),
+        new-beneficiaries: (optional (list 10 { address: principal, share: uint })),
+        new-threshold: (optional uint),
+        new-backup-executors: (optional (list 3 principal)),
+        new-emergency-contact: (optional principal),
+        proposed-at: uint,
+        effective-at: uint,
+        is-active: bool,
+        version: uint
+    })
+
+(define-map will-versions
+    principal
+    uint)
 
 
 
@@ -299,6 +323,12 @@
 (define-read-only (get-encrypted-will (owner principal))
     (map-get? encrypted-wills owner))
 
+(define-read-only (get-will-amendment (amendment-id uint))
+    (map-get? will-amendments amendment-id))
+
+(define-read-only (get-will-version (owner principal))
+    (default-to u1 (map-get? will-versions owner)))
+
 (define-private (execute-will (owner principal))
     (let ((will (unwrap! (get-will owner) ERR-NOT-REGISTERED)))
         (map-set wills owner (merge will { is-deceased: true }))
@@ -331,4 +361,55 @@
     (let ((request (unwrap! (map-get? emergency-requests request-id) ERR-NOT-REGISTERED)))
         (map-set emergency-requests request-id (merge request { is-executed: true }))
         (execute-will (get will-owner request))))
+
+(define-public (propose-will-amendment (amendment-type (string-ascii 20))
+                                      (new-beneficiaries (optional (list 10 { address: principal, share: uint })))
+                                      (new-threshold (optional uint))
+                                      (new-backup-executors (optional (list 3 principal)))
+                                      (new-emergency-contact (optional principal)))
+    (let ((existing-will (unwrap! (get-will tx-sender) ERR-NOT-REGISTERED))
+          (amendment-id (+ (var-get amendment-counter) u1))
+          (current-version (get-will-version tx-sender))
+          (effective-block (+ burn-block-height (var-get amendment-grace-period))))
+        (asserts! (not (get is-deceased existing-will)) ERR-ALREADY-DECEASED)
+        (var-set amendment-counter amendment-id)
+        (map-set will-amendments amendment-id {
+            will-owner: tx-sender,
+            amendment-type: amendment-type,
+            new-beneficiaries: new-beneficiaries,
+            new-threshold: new-threshold,
+            new-backup-executors: new-backup-executors,
+            new-emergency-contact: new-emergency-contact,
+            proposed-at: burn-block-height,
+            effective-at: effective-block,
+            is-active: false,
+            version: (+ current-version u1)
+        })
+        (ok amendment-id)))
+
+(define-public (activate-amendment (amendment-id uint))
+    (let ((amendment (unwrap! (map-get? will-amendments amendment-id) ERR-AMENDMENT-NOT-FOUND))
+          (existing-will (unwrap! (get-will (get will-owner amendment)) ERR-NOT-REGISTERED)))
+        (asserts! (is-eq tx-sender (get will-owner amendment)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get is-active amendment)) ERR-AMENDMENT-ALREADY-ACTIVE)
+        (asserts! (>= burn-block-height (get effective-at amendment)) ERR-GRACE-PERIOD-ACTIVE)
+        (asserts! (not (get is-deceased existing-will)) ERR-ALREADY-DECEASED)
+        (let ((updated-will (merge existing-will {
+                beneficiaries: (default-to (get beneficiaries existing-will) (get new-beneficiaries amendment)),
+                inactivity-threshold: (default-to (get inactivity-threshold existing-will) (get new-threshold amendment)),
+                backup-executors: (default-to (get backup-executors existing-will) (get new-backup-executors amendment)),
+                emergency-contact: (default-to (get emergency-contact existing-will) (get new-emergency-contact amendment))
+            })))
+            (map-set wills (get will-owner amendment) updated-will)
+            (map-set will-amendments amendment-id (merge amendment { is-active: true }))
+            (map-set will-versions (get will-owner amendment) (get version amendment))
+            (ok true))))
+
+(define-public (cancel-amendment (amendment-id uint))
+    (let ((amendment (unwrap! (map-get? will-amendments amendment-id) ERR-AMENDMENT-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (get will-owner amendment)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get is-active amendment)) ERR-AMENDMENT-ALREADY-ACTIVE)
+        (asserts! (< burn-block-height (get effective-at amendment)) ERR-AMENDMENT-EXPIRED)
+        (map-delete will-amendments amendment-id)
+        (ok true)))
 
