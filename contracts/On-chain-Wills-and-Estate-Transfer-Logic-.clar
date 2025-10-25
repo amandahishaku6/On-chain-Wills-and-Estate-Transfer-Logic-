@@ -25,6 +25,10 @@
 (define-constant ERR-AMENDMENT-ALREADY-ACTIVE (err u115))
 (define-constant ERR-GRACE-PERIOD-ACTIVE (err u116))
 (define-constant ERR-AMENDMENT-EXPIRED (err u117))
+(define-constant ERR-TIME-LOCK-ACTIVE (err u118))
+(define-constant ERR-NO-CLAIMABLE-AMOUNT (err u119))
+(define-constant ERR-ALREADY-CLAIMED (err u120))
+(define-constant ERR-WILL-NOT-EXECUTED (err u121))
 
 ;; Data variables
 (define-data-var oracle-address principal 'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM)
@@ -144,6 +148,23 @@
 (define-map will-versions
     principal
     uint)
+
+(define-map time-lock-configs
+    principal
+    {
+        time-lock-period: uint,
+        execution-block: uint,
+        is-time-locked: bool
+    })
+
+(define-map claim-records
+    { will-owner: principal, beneficiary: principal }
+    {
+        total-amount: uint,
+        claimed-amount: uint,
+        claimable-at: uint,
+        has-claimed: bool
+    })
 
 
 
@@ -329,11 +350,29 @@
 (define-read-only (get-will-version (owner principal))
     (default-to u1 (map-get? will-versions owner)))
 
+(define-read-only (get-time-lock-config (owner principal))
+    (map-get? time-lock-configs owner))
+
+(define-read-only (get-claim-record (will-owner principal) (beneficiary principal))
+    (map-get? claim-records { will-owner: will-owner, beneficiary: beneficiary }))
+
 (define-private (execute-will (owner principal))
-    (let ((will (unwrap! (get-will owner) ERR-NOT-REGISTERED)))
+    (let ((will (unwrap! (get-will owner) ERR-NOT-REGISTERED))
+          (time-lock-config (map-get? time-lock-configs owner)))
         (map-set wills owner (merge will { is-deceased: true }))
-        (unwrap! (distribute-assets owner (get beneficiaries will)) (err u500))
-        (ok true)))
+        (match time-lock-config
+            lock-config
+            (if (get is-time-locked lock-config)
+                (begin
+                    (map-set time-lock-configs owner (merge lock-config { execution-block: burn-block-height }))
+                    (unwrap! (setup-beneficiary-claims owner (get beneficiaries will) (get time-lock-period lock-config)) (err u500))
+                    (ok true))
+                (begin
+                    (unwrap! (distribute-assets owner (get beneficiaries will)) (err u500))
+                    (ok true)))
+            (begin
+                (unwrap! (distribute-assets owner (get beneficiaries will)) (err u500))
+                (ok true)))))
 
 (define-private (distribute-assets (owner principal) (beneficiaries (list 10 { address: principal, share: uint })))
     (let ((total-stx (stx-get-balance owner)))
@@ -412,4 +451,53 @@
         (asserts! (< burn-block-height (get effective-at amendment)) ERR-AMENDMENT-EXPIRED)
         (map-delete will-amendments amendment-id)
         (ok true)))
+
+(define-public (set-time-lock (time-lock-period uint))
+    (let ((existing-will (unwrap! (get-will tx-sender) ERR-NOT-REGISTERED)))
+        (asserts! (not (get is-deceased existing-will)) ERR-ALREADY-DECEASED)
+        (asserts! (> time-lock-period u0) ERR-INVALID-BENEFICIARY)
+        (map-set time-lock-configs tx-sender {
+            time-lock-period: time-lock-period,
+            execution-block: u0,
+            is-time-locked: true
+        })
+        (ok true)))
+
+(define-public (claim-inheritance (will-owner principal))
+    (let ((will (unwrap! (get-will will-owner) ERR-NOT-REGISTERED))
+          (claim-record (unwrap! (map-get? claim-records { will-owner: will-owner, beneficiary: tx-sender }) ERR-NOT-REGISTERED))
+          (time-lock-config (unwrap! (map-get? time-lock-configs will-owner) ERR-WILL-NOT-EXECUTED)))
+        (asserts! (get is-deceased will) ERR-STILL-ALIVE)
+        (asserts! (get is-time-locked time-lock-config) ERR-WILL-NOT-EXECUTED)
+        (asserts! (>= burn-block-height (get claimable-at claim-record)) ERR-TIME-LOCK-ACTIVE)
+        (asserts! (not (get has-claimed claim-record)) ERR-ALREADY-CLAIMED)
+        (let ((claimable-amount (- (get total-amount claim-record) (get claimed-amount claim-record))))
+            (asserts! (> claimable-amount u0) ERR-NO-CLAIMABLE-AMOUNT)
+            (unwrap! (as-contract (stx-transfer? claimable-amount will-owner tx-sender)) (err u500))
+            (map-set claim-records { will-owner: will-owner, beneficiary: tx-sender }
+                (merge claim-record {
+                    claimed-amount: (get total-amount claim-record),
+                    has-claimed: true
+                }))
+            (ok claimable-amount))))
+
+(define-private (setup-beneficiary-claims (owner principal) (beneficiaries (list 10 { address: principal, share: uint })) (time-lock-period uint))
+    (let ((total-stx (stx-get-balance owner))
+          (claimable-at (+ burn-block-height time-lock-period)))
+        (map setup-claim-record beneficiaries)
+        (ok true)))
+
+(define-private (setup-claim-record (beneficiary { address: principal, share: uint }))
+    (let ((amount (* (get share beneficiary) u1000))
+          (will-owner tx-sender)
+          (time-lock-config (unwrap-panic (map-get? time-lock-configs will-owner)))
+          (claimable-at (+ (get execution-block time-lock-config) (get time-lock-period time-lock-config))))
+        (map-set claim-records { will-owner: will-owner, beneficiary: (get address beneficiary) }
+            {
+                total-amount: amount,
+                claimed-amount: u0,
+                claimable-at: claimable-at,
+                has-claimed: false
+            })
+        true))
 
