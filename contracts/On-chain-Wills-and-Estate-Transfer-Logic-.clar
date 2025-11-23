@@ -356,6 +356,34 @@
 (define-read-only (get-claim-record (will-owner principal) (beneficiary principal))
     (map-get? claim-records { will-owner: will-owner, beneficiary: beneficiary }))
 
+(define-read-only (get-will-overview (owner principal) (beneficiary principal))
+    (let ((will (map-get? wills owner))
+          (version (get-will-version owner))
+          (time-lock (map-get? time-lock-configs owner))
+          (encryption (match (map-get? encrypted-wills owner)
+                         encrypted
+                         (some {
+                             is-encrypted: (get is-encrypted encrypted),
+                             decryption-authorized: (get decryption-authorized encrypted)
+                         })
+                         none))
+          (claim (match (map-get? claim-records { will-owner: owner, beneficiary: beneficiary })
+                    record
+                    (some {
+                        total-amount: (get total-amount record),
+                        claimed-amount: (get claimed-amount record),
+                        claimable-at: (get claimable-at record),
+                        has-claimed: (get has-claimed record)
+                    })
+                    none)))
+        (ok {
+            will: will,
+            version: version,
+            time-lock: time-lock,
+            encryption: encryption,
+            claim: claim
+        })))
+
 (define-private (execute-will (owner principal))
     (let ((will (unwrap! (get-will owner) ERR-NOT-REGISTERED))
           (time-lock-config (map-get? time-lock-configs owner)))
